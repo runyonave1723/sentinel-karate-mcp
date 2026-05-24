@@ -177,30 +177,27 @@ async function runTests() {
 
 // ─── Build prompt ─────────────────────────────────────────────────────────────
 function buildPrompt(failures, fileContents) {
-  return `You are an expert Karate API test engineer and self-healing agent.
+  // Compact file content: strip blank lines to reduce tokens
+  const compactFiles = Object.entries(fileContents).map(([f, c]) => {
+    const compact = c.split('\n').filter(l => l.trim()).join('\n');
+    return `=== ${f} ===\n${compact}`;
+  }).join('\n\n');
 
-CURRENT FEATURE FILES:
-${Object.entries(fileContents).map(([f, c]) => `=== FILE: ${f} ===\n${c}\n`).join('\n')}
+  // Compact failures: strip long response bodies
+  const compactFailures = failures.map(f =>
+    f.split('\n').map(l => l.length > 200 ? l.slice(0, 200) + '...' : l).join('\n')
+  ).join('\n---\n');
 
-TEST FAILURES:
-${failures.join('\n\n---\n\n')}
+  return `Fix failing Karate API tests. Return ONLY a JSON array, no markdown.
 
-TASK: Analyze the failures and identify what is wrong in the feature files.
-Common issues: wrong status code (e.g. 199 instead of 200), wrong field name, wrong path.
+FILES:
+${compactFiles}
 
-Respond with ONLY a valid JSON array — no markdown, no backticks, no explanation:
-[
-  {
-    "file": "karate/orders/orders.feature",
-    "reason": "Status code assertion was 199, corrected to 200",
-    "patchedContent": "...complete corrected content of the feature file..."
-  }
-]
+FAILURES:
+${compactFailures}
 
-Rules:
-1. Only include files that need changes
-2. Do NOT break passing scenarios
-3. Return ONLY valid JSON — no markdown fences, no extra text`;
+Return JSON array:
+[{"file":"path/to/file.feature","reason":"what was wrong","patchedContent":"full corrected file content"}]`;
 }
 
 // ─── Call Ollama (local, free) ────────────────────────────────────────────────
@@ -290,15 +287,35 @@ async function callGroq(prompt) {
 async function healWithAI(failures, featureFiles) {
   console.log(`\n🔧 Analyzing ${failures.length} failure(s) with ${PROVIDER}/${MODEL}...`);
 
+  // Extract which feature files are mentioned in failures
+  const mentionedFiles = new Set();
+  for (const failure of failures) {
+    for (const f of featureFiles) {
+      const rel = f.replace(path.join(KARATE_DIR, 'src', 'test', 'resources') + path.sep, '').replace(/\\/g, '/');
+      const basename = path.basename(f, '.feature');
+      if (failure.includes(rel) || failure.toLowerCase().includes(basename.toLowerCase())) {
+        mentionedFiles.add(f);
+      }
+    }
+  }
+  // Fallback: use all files if none matched
+  const filesToSend = mentionedFiles.size > 0 ? [...mentionedFiles] : featureFiles;
+
   const fileContents = {};
-  for (const f of featureFiles) {
+  for (const f of filesToSend) {
     const rel = f
       .replace(path.join(KARATE_DIR, 'src', 'test', 'resources') + path.sep, '')
       .replace(/\\/g, '/');
-    fileContents[rel] = await readFile(f, 'utf8');
+    // Trim content to avoid token limits - remove comments and blank lines
+    const raw = await readFile(f, 'utf8');
+    fileContents[rel] = raw;
   }
 
+  console.log(`   📄 Sending ${Object.keys(fileContents).length} file(s) to AI: ${Object.keys(fileContents).join(', ')}`);
+
   const prompt = buildPrompt(failures, fileContents);
+  const tokenEstimate = Math.ceil(prompt.length / 4);
+  console.log(`   📊 Estimated prompt size: ~${tokenEstimate} tokens`);
 
   let rawText = '';
   try {
