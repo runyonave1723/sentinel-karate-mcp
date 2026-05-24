@@ -111,7 +111,12 @@ async function parseKarateJsonReports() {
           if (failedSteps.length > 0) {
             failedScenarios++;
             const stepDetails = failedSteps.map(s =>
-              `  Step: ${s.keyword} ${s.name}\n  Error: ${(s.result?.error_message || 'unknown').slice(0, 400)}`
+              `  Step: ${s.keyword} ${s.name}\n  Error: ${
+                (s.result?.error_message || 'unknown')
+                  .replace(/,\s*response[\s\S]*/i, '')
+                  .replace(/response:[\s\S]*/i, '')
+                  .slice(0, 250)
+              }`
             ).join('\n');
             failures.push(
               `FEATURE: ${feature.name || file}\n` +
