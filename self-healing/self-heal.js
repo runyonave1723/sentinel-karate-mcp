@@ -26,10 +26,15 @@ const get           = (flag) => { const i = args.indexOf(flag); return i !== -1 
 const TAG           = get('--tag');
 const MAX_RETRIES   = parseInt(get('--max-retries') || '3');
 const DEBUG         = args.includes('--debug');
-const PROVIDER      = get('--provider') || 'ollama';          // ollama | claude
-const MODEL         = get('--model')    || (PROVIDER === 'claude' ? 'claude-opus-4-5' : 'llama3.1');
+const PROVIDER      = get('--provider') || 'groq';            // groq | ollama | claude
+const MODEL         = get('--model')    || (
+  PROVIDER === 'claude' ? 'claude-opus-4-5' :
+  PROVIDER === 'groq'   ? 'llama-3.1-8b-instant' :
+  'llama3.1'
+);
 const CLI_KEY       = get('--key');
-const CLAUDE_KEY    = process.env.ANTHROPIC_API_KEY || CLI_KEY || null;
+const CLAUDE_KEY    = process.env.ANTHROPIC_API_KEY || (PROVIDER === 'claude' ? CLI_KEY : null) || null;
+const GROQ_KEY      = process.env.GROQ_API_KEY || (PROVIDER === 'groq' ? CLI_KEY : null) || null;
 const OLLAMA_URL    = get('--ollama-url') || 'http://localhost:11434';
 
 function getTestMethod(tag) {
@@ -251,6 +256,36 @@ async function callClaude(prompt) {
   return data.content?.[0]?.text || '';
 }
 
+
+// ─── Call Groq API (free, fast, no local RAM needed) ─────────────────────────
+async function callGroq(prompt) {
+  if (!GROQ_KEY) throw new Error('GROQ_API_KEY not set. Get free key at console.groq.com, then: export GROQ_API_KEY=your_key');
+
+  console.log(`   ⚡ Calling Groq (${MODEL})...`);
+
+  const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${GROQ_KEY}`
+    },
+    body: JSON.stringify({
+      model: MODEL,
+      messages: [
+        { role: 'system', content: 'You are a Karate API test engineer. Always respond with valid JSON only, no markdown.' },
+        { role: 'user', content: prompt }
+      ],
+      temperature: 0.1,
+      max_tokens: 8000
+    })
+  });
+
+  if (!response.ok) throw new Error(`Groq API error ${response.status}: ${await response.text()}`);
+
+  const data = await response.json();
+  return data.choices?.[0]?.message?.content || '';
+}
+
 // ─── Heal with AI ─────────────────────────────────────────────────────────────
 async function healWithAI(failures, featureFiles) {
   console.log(`\n🔧 Analyzing ${failures.length} failure(s) with ${PROVIDER}/${MODEL}...`);
@@ -269,6 +304,8 @@ async function healWithAI(failures, featureFiles) {
   try {
     if (PROVIDER === 'claude') {
       rawText = await callClaude(prompt);
+    } else if (PROVIDER === 'groq') {
+      rawText = await callGroq(prompt);
     } else {
       rawText = await callOllama(prompt);
     }
@@ -277,6 +314,9 @@ async function healWithAI(failures, featureFiles) {
     if (PROVIDER === 'ollama') {
       console.error('   💡 Is Ollama running? Try: ollama serve');
       console.error(`   💡 Is the model pulled? Try: ollama pull ${MODEL}`);
+    } else if (PROVIDER === 'groq') {
+      console.error('   💡 Get a free Groq key at console.groq.com');
+      console.error('   💡 Then run: export GROQ_API_KEY=your_key');
     }
     return [];
   }
@@ -333,8 +373,15 @@ async function applyPatches(patches, featureFiles) {
 // ─── Main ─────────────────────────────────────────────────────────────────────
 async function main() {
   if (PROVIDER === 'claude' && !CLAUDE_KEY) {
-    console.error('❌ Claude provider selected but ANTHROPIC_API_KEY not set.');
-    console.error('   Switch to Ollama: node self-heal.js --provider ollama');
+    console.error('❌ Claude provider needs ANTHROPIC_API_KEY.');
+    console.error('   Or use Groq (free): node self-heal.js --provider groq --key gsk_...');
+    process.exit(1);
+  }
+  if (PROVIDER === 'groq' && !GROQ_KEY) {
+    console.error('❌ Groq provider needs GROQ_API_KEY.');
+    console.error('   1. Get free key at console.groq.com');
+    console.error('   2. export GROQ_API_KEY=gsk_your_key');
+    console.error('   Or pass inline: node self-heal.js --provider groq --key gsk_...');
     process.exit(1);
   }
 
