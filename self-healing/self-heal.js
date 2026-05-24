@@ -24,6 +24,18 @@ const TAG = tagIndex !== -1 ? args[tagIndex + 1] : null;
 const MAX_RETRIES = retriesIndex !== -1 ? parseInt(args[retriesIndex + 1]) : 3;
 const DEBUG = args.includes('--debug');
 
+// Map CLI tag to JUnit5 test method name in KarateTestRunner
+function getTestMethod(tag) {
+  if (!tag) return 'runAllTests';
+  const t = tag.replace('@', '').toLowerCase();
+  const map = {
+    smoke:     'runSmokeTests',
+    inventory: 'runInventoryTests',
+    orders:    'runOrderTests'
+  };
+  return map[t] || 'runAllTests';
+}
+
 console.log(`\n🤖 Sentinel Self-Healing Test Runner`);
 console.log(`   Tag: ${TAG || 'all'} | Max retries: ${MAX_RETRIES} | Debug: ${DEBUG}`);
 console.log(`   Karate dir: ${KARATE_DIR}\n`);
@@ -35,7 +47,7 @@ async function listFeatureFiles(dir) {
     for (const entry of entries) {
       const full = path.join(dir, entry.name);
       if (entry.isDirectory()) result.push(...await listFeatureFiles(full));
-      else if (entry.name.endsWith('.feature') && !entry.name.endsWith('.bak')) result.push(full);
+      else if (entry.name.endsWith('.feature')) result.push(full);
     }
   } catch {}
   return result;
@@ -47,7 +59,6 @@ function extractFailures(output) {
   let current = [];
   let capturing = false;
 
-  // Comprehensive Karate failure patterns
   const failurePatterns = [
     /FAILED/,
     /AssertionError/i,
@@ -59,10 +70,10 @@ function extractFailures(output) {
     /scenario.*failed/i,
     /not equal/i,
     /expected.*\d{3}/i,
-    /\* status \d+/i,
-    /html response/i,
     /assert.*failed/i,
-    /karate.*FAIL/i
+    /karate.*FAIL/i,
+    /^\s*\* status \d+/,
+    /html.* was:/i
   ];
 
   for (let i = 0; i < lines.length; i++) {
@@ -71,7 +82,6 @@ function extractFailures(output) {
 
     if (isFailure && !capturing) {
       capturing = true;
-      // Include 5 lines before for context
       current = lines.slice(Math.max(0, i - 5), i + 1);
     } else if (capturing) {
       current.push(line);
@@ -84,22 +94,23 @@ function extractFailures(output) {
   }
   if (current.length > 0) failures.push(current.join('\n'));
 
-  // Fallback: if nothing matched but build failed, grab last 150 lines
+  // Fallback: build failed but no specific pattern matched → send last 150 lines
   if (failures.length === 0 && output.includes('BUILD FAILURE')) {
-    console.log('   ⚠️  No specific failure patterns matched — sending full build failure to Claude');
-    const allLines = output.split('\n');
-    failures.push(allLines.slice(-150).join('\n'));
+    console.log('   ⚠️  No specific failure pattern matched — sending full build output to Claude');
+    failures.push(output.split('\n').slice(-150).join('\n'));
   }
 
   return failures;
 }
 
 async function runTests() {
-  // Remove -q flag so we get full Karate output including failure details
-  let cmd = `cd "${KARATE_DIR}" && mvn test -Dkarate.env=dev`;
-  if (TAG) cmd += ` -Dkarate.options="--tags ${TAG}"`;
+  const method = getTestMethod(TAG);
 
-  console.log(`▶ Running: mvn test${TAG ? ' --tags ' + TAG : ''}`);
+  // Run specific JUnit5 test method — this is reliable in Karate 1.4.1
+  // -Dsurefire.failIfNoSpecifiedTests=false prevents error when filtering
+  const cmd = `cd "${KARATE_DIR}" && mvn test -Dtest=KarateTestRunner#${method} -Dsurefire.failIfNoSpecifiedTests=false`;
+
+  console.log(`▶ Running: KarateTestRunner#${method}`);
 
   let output = '';
   let success = false;
@@ -114,21 +125,30 @@ async function runTests() {
   }
 
   if (DEBUG) {
-    console.log('\n─── RAW OUTPUT (last 80 lines) ───');
-    console.log(output.split('\n').slice(-80).join('\n'));
-    console.log('─────────────────────────────────\n');
+    console.log('\n─── RAW OUTPUT (last 100 lines) ───');
+    console.log(output.split('\n').slice(-100).join('\n'));
+    console.log('───────────────────────────────────\n');
   }
 
+  // Karate prints its own summary line
   const summaryMatch = output.match(/Tests run: \d+, Failures: \d+, Errors: \d+, Skipped: \d+/);
-  const summary = summaryMatch ? summaryMatch[0] : (success ? 'BUILD SUCCESS' : 'BUILD FAILURE');
+  const karateMatch  = output.match(/scenarios.*failed/i);
+  const buildResult  = output.includes('BUILD SUCCESS') ? 'BUILD SUCCESS' : 'BUILD FAILURE';
+
+  const summary = summaryMatch
+    ? summaryMatch[0]
+    : karateMatch
+    ? karateMatch[0]
+    : buildResult;
+
   console.log(`   ${success ? '✅' : '❌'} ${summary}`);
 
   const failures = extractFailures(output);
-  console.log(`   🔍 Failures detected: ${failures.length}`);
+  console.log(`   🔍 Failures extracted: ${failures.length}`);
 
   if (DEBUG && failures.length > 0) {
     console.log('\n─── EXTRACTED FAILURES ───');
-    failures.forEach((f, i) => console.log(`\n[Failure ${i+1}]\n${f}`));
+    failures.forEach((f, i) => console.log(`\n[Failure ${i + 1}]\n${f}`));
     console.log('──────────────────────────\n');
   }
 
@@ -137,19 +157,18 @@ async function runTests() {
 
 async function healWithClaude(failures, featureFiles) {
   if (!ANTHROPIC_API_KEY) {
-    console.error('\n❌ ANTHROPIC_API_KEY is not set!');
-    console.error('   Run: set ANTHROPIC_API_KEY=your_key_here   (Windows CMD)');
-    console.error('   Run: export ANTHROPIC_API_KEY=your_key_here (Mac/Linux)');
+    console.error('\n❌ ANTHROPIC_API_KEY not set!');
+    console.error('   CMD:  set ANTHROPIC_API_KEY=sk-ant-...');
     return [];
   }
 
-  console.log(`\n🔧 Calling Claude (claude-opus-4-5) to analyze ${failures.length} failure(s)...`);
+  console.log(`\n🔧 Calling Claude to analyze ${failures.length} failure(s)...`);
 
-  // Read all feature files
   const fileContents = {};
   for (const f of featureFiles) {
-    const rel = f.replace(path.join(KARATE_DIR, 'src', 'test', 'resources') + path.sep, '')
-                  .replace(/\\/g, '/');
+    const rel = f
+      .replace(path.join(KARATE_DIR, 'src', 'test', 'resources') + path.sep, '')
+      .replace(/\\/g, '/');
     fileContents[rel] = await readFile(f, 'utf8');
   }
 
@@ -161,8 +180,8 @@ ${Object.entries(fileContents).map(([f, c]) => `=== FILE: ${f} ===\n${c}\n`).joi
 TEST FAILURES:
 ${failures.join('\n\n---\n\n')}
 
-TASK: Analyze each failure carefully. The failures show what went wrong when running Karate tests.
-Identify what is wrong in the feature file (wrong status code assertion, wrong field name, wrong path, wrong request body, etc.) and provide the corrected file.
+TASK: Analyze the failures and identify what is wrong in the feature files.
+Common issues: wrong status code assertion, wrong field name, wrong HTTP method, wrong path, wrong request body.
 
 Respond with ONLY a valid JSON array — no markdown, no backticks, no explanation outside the JSON:
 [
@@ -175,9 +194,9 @@ Respond with ONLY a valid JSON array — no markdown, no backticks, no explanati
 
 Rules:
 1. Only include files that actually need changes
-2. Do NOT break passing scenarios — only fix the failing ones
-3. Fix the exact assertion/status code/field that is failing
-4. Return ONLY valid JSON, no markdown code blocks`;
+2. Do NOT break passing scenarios
+3. Fix only the exact assertion that is failing
+4. Return ONLY valid JSON — no markdown fences`;
 
   try {
     const response = await fetch('https://api.anthropic.com/v1/messages', {
@@ -195,8 +214,7 @@ Rules:
     });
 
     if (!response.ok) {
-      const errText = await response.text();
-      console.error(`   ❌ Claude API error ${response.status}: ${errText}`);
+      console.error(`   ❌ Claude API error ${response.status}: ${await response.text()}`);
       return [];
     }
 
@@ -205,17 +223,14 @@ Rules:
 
     if (DEBUG) {
       console.log('\n─── CLAUDE RESPONSE ───');
-      console.log(text.slice(0, 1000));
+      console.log(text.slice(0, 1500));
       console.log('───────────────────────\n');
     }
 
-    // Strip any accidental markdown fences
     const clean = text.replace(/```json\n?|```/g, '').trim();
-
-    const patches = JSON.parse(clean);
-    return patches;
+    return JSON.parse(clean);
   } catch (e) {
-    console.error(`   ❌ Failed to call/parse Claude: ${e.message}`);
+    console.error(`   ❌ Claude call/parse failed: ${e.message}`);
     return [];
   }
 }
@@ -225,15 +240,15 @@ async function applyPatches(patches, featureFiles) {
   for (const patch of patches) {
     if (!patch.file || !patch.patchedContent) continue;
 
-    // Try direct path first, then search
+    // Find the actual file path (handle Windows backslashes)
+    const normalizedPatch = patch.file.replace(/\\/g, '/');
     let fullPath = path.join(KARATE_DIR, 'src', 'test', 'resources', patch.file);
 
-    // Also search by filename in case path separator differs
-    if (!featureFiles.find(f => f.replace(/\\/g, '/').includes(patch.file.replace(/\\/g, '/')))) {
-      const fileName = path.basename(patch.file);
-      const match = featureFiles.find(f => path.basename(f) === fileName);
-      if (match) fullPath = match;
-    }
+    const match = featureFiles.find(f =>
+      f.replace(/\\/g, '/').includes(normalizedPatch) ||
+      path.basename(f) === path.basename(patch.file)
+    );
+    if (match) fullPath = match;
 
     try {
       const original = await readFile(fullPath, 'utf8');
@@ -249,13 +264,13 @@ async function applyPatches(patches, featureFiles) {
   return applied;
 }
 
-// ─── Main loop ────────────────────────────────────────────────────────────────
+// ─── Main ─────────────────────────────────────────────────────────────────────
 
 async function main() {
   if (!ANTHROPIC_API_KEY) {
-    console.error('❌ ANTHROPIC_API_KEY is not set. Self-healing requires it.');
-    console.error('   CMD:   set ANTHROPIC_API_KEY=sk-ant-...');
-    console.error('   Bash:  export ANTHROPIC_API_KEY=sk-ant-...');
+    console.error('❌ ANTHROPIC_API_KEY is not set.');
+    console.error('   CMD:  set ANTHROPIC_API_KEY=sk-ant-...');
+    console.error('   Bash: export ANTHROPIC_API_KEY=sk-ant-...');
     process.exit(1);
   }
 
@@ -278,32 +293,30 @@ async function main() {
     }
 
     if (attempt > MAX_RETRIES) {
-      console.log(`\n⛔ Max retries (${MAX_RETRIES}) reached. Some failures remain.`);
-      console.log('   Tip: Run with --debug to see raw output and extracted failures');
+      console.log(`\n⛔ Max retries (${MAX_RETRIES}) reached. Failures remain.`);
+      console.log('   Run with --debug to see raw output and failures extracted.');
       break;
     }
 
     const patches = await healWithClaude(lastResult.failures, featureFiles);
-
     if (patches.length === 0) {
-      console.log('\n⚠️  Claude could not generate patches. Stopping.');
-      console.log('   Tip: Run with --debug to see what Claude received');
+      console.log('\n⚠️  Claude generated no patches. Stopping.');
       break;
     }
 
     const applied = await applyPatches(patches, featureFiles);
     if (applied.length === 0) {
-      console.log('\n⚠️  No patches could be applied. Stopping.');
+      console.log('\n⚠️  No patches applied. Stopping.');
       break;
     }
 
-    console.log(`\n↻ Re-running tests after patching ${applied.length} file(s)...`);
+    console.log(`\n↻ Re-running after patching ${applied.length} file(s)...`);
   }
 
   process.exit(lastResult?.success ? 0 : 1);
 }
 
 main().catch(err => {
-  console.error('Fatal error:', err);
+  console.error('Fatal:', err);
   process.exit(1);
 });
