@@ -1,35 +1,46 @@
 package karate;
 
-import com.intuit.karate.junit5.Karate;
+import com.intuit.karate.Results;
+import com.intuit.karate.Runner;
 import org.junit.jupiter.api.Test;
-// Note: com.intuit.karate groupId confirmed for 1.4.1
+import static org.junit.jupiter.api.Assertions.*;
 
 class KarateTestRunner {
 
     @Test
     void runAllTests() {
-        Karate.run("classpath:karate")
-            .relativeTo(getClass())
+        Results results = Runner.path("classpath:karate")
             .outputCucumberJson(true)
-            .outputJunitXml(true);
+            .outputJunitXml(true)
+            .parallel(1);
+        assertEquals(0, results.getFailCount(), results.getErrorMessages());
     }
 
     @Test
     void runInventoryTests() {
-        Karate.run("classpath:karate/inventory")
-            .relativeTo(getClass());
+        Results results = Runner.path("classpath:karate/inventory")
+            .outputCucumberJson(true)
+            .outputJunitXml(true)
+            .parallel(1);
+        assertEquals(0, results.getFailCount(), results.getErrorMessages());
     }
 
     @Test
     void runOrderTests() {
-        Karate.run("classpath:karate/orders")
-            .relativeTo(getClass());
+        Results results = Runner.path("classpath:karate/orders")
+            .outputCucumberJson(true)
+            .outputJunitXml(true)
+            .parallel(1);
+        assertEquals(0, results.getFailCount(), results.getErrorMessages());
     }
 
     @Test
     void runSmokeTests() {
-        Karate.run("classpath:karate")
+        Results results = Runner.path("classpath:karate")
             .tags("@smoke")
-            .relativeTo(getClass());
+            .outputCucumberJson(true)
+            .outputJunitXml(true)
+            .parallel(1);
+        assertEquals(0, results.getFailCount(), results.getErrorMessages());
     }
 }
