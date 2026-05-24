@@ -322,6 +322,87 @@ async function callGroq(prompt) {
   return data.choices?.[0]?.message?.content || '';
 }
 
+
+// ─── Rule-based healer (no AI needed for common fixes) ───────────────────────
+async function ruleBasedHeal(failures, featureFiles) {
+  const patches = [];
+
+  for (const failure of failures) {
+    const stepMatch    = failure.match(/Step:\s*(.+)/);
+    const errorMatch   = failure.match(/Error:\s*(.+)/);
+    const featureMatch = failure.match(/FEATURE:\s*(.+)/);
+    const scenarioMatch= failure.match(/SCENARIO:\s*(.+)/);
+
+    if (!stepMatch || !errorMatch) continue;
+
+    const step     = stepMatch[1].trim();
+    const error    = errorMatch[1].trim();
+    const feature  = featureMatch ? featureMatch[1].trim() : null;
+
+    // Find the actual feature file
+    const targetFile = featureFiles.find(f =>
+      feature && (f.replace(/\\/g,'/').includes(feature.replace(/\\/g,'/')) ||
+      path.basename(f).includes(path.basename(feature || '')))
+    ) || featureFiles.find(f => f.replace(/\\/g,'/').includes('orders')) || featureFiles[0];
+
+    if (!targetFile) continue;
+    let fileContent = await readFile(targetFile, 'utf8');
+    const relPath = targetFile
+      .replace(path.join(KARATE_DIR,'src','test','resources') + path.sep, '')
+      .replace(/\\/g, '/');
+
+    let fixed = false;
+    let reason = '';
+
+    // Rule 1: Wrong status code
+    // Error: "status code was: 200, expected: 199"
+    const statusErrorMatch = error.match(/status code was:\s*(\d+),\s*expected:\s*(\d+)/i);
+    if (statusErrorMatch) {
+      const actual   = statusErrorMatch[1]; // what server returned
+      const expected = statusErrorMatch[2]; // what test expected (wrong)
+      // Fix: replace the wrong expected with the actual
+      const wrongLine  = `status ${expected}`;
+      const correctLine= `status ${actual}`;
+      if (fileContent.includes(wrongLine)) {
+        // Only fix in the right scenario
+        const scenarioName = scenarioMatch ? scenarioMatch[1].trim() : null;
+        if (scenarioName) {
+          // Replace only within the failing scenario block
+          const lines = fileContent.split('\n');
+          let inTarget = false;
+          const fixed_lines = lines.map(line => {
+            if (line.includes(scenarioName)) inTarget = true;
+            if (inTarget && line.match(/^\s*(Scenario|Feature):/i) && !line.includes(scenarioName)) inTarget = false;
+            if (inTarget && line.trim() === wrongLine) {
+              return line.replace(wrongLine, correctLine);
+            }
+            return line;
+          });
+          fileContent = fixed_lines.join('\n');
+        } else {
+          fileContent = fileContent.replace(wrongLine, correctLine);
+        }
+        reason = `Status code was ${expected}, corrected to ${actual} (server returned ${actual})`;
+        fixed = true;
+      }
+    }
+
+    // Rule 2: Field name mismatch - "$.fieldName" not found
+    const fieldMatch = error.match(/\$\.([\w.]+).*not found/i);
+    if (!fixed && fieldMatch) {
+      reason = `Field $.${fieldMatch[1]} not found in response`;
+      // Can't auto-fix without knowing the right field name, skip
+    }
+
+    if (fixed) {
+      patches.push({ file: relPath, reason, patchedContent: fileContent, fullFile: true });
+      console.log(`   ✏️  Rule-based fix: ${reason}`);
+    }
+  }
+
+  return patches;
+}
+
 // ─── Heal with AI ─────────────────────────────────────────────────────────────
 async function healWithAI(failures, featureFiles) {
   console.log(`\n🔧 Analyzing ${failures.length} failure(s) with ${PROVIDER}/${MODEL}...`);
@@ -465,9 +546,14 @@ async function main() {
       break;
     }
 
-    const patches = await healWithAI(lastResult.failures, featureFiles);
+    // Try rule-based healing first (instant, no API needed)
+    let patches = await ruleBasedHeal(lastResult.failures, featureFiles);
     if (patches.length === 0) {
-      console.log('\n⚠️  AI generated no patches. Stopping.');
+      console.log('   🤖 No rule matched, trying AI...');
+      patches = await healWithAI(lastResult.failures, featureFiles);
+    }
+    if (patches.length === 0) {
+      console.log('\n⚠️  No patches generated. Stopping.');
       break;
     }
 
