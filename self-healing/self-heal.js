@@ -14,15 +14,19 @@ const execAsync = promisify(exec);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, '..');
 const KARATE_DIR = path.join(REPO_ROOT, 'karate-tests');
-const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+// API key: env var or --key CLI arg
+let ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 
 // Parse CLI args
 const args = process.argv.slice(2);
 const tagIndex = args.indexOf('--tag');
 const retriesIndex = args.indexOf('--max-retries');
+const keyIndex = args.indexOf('--key');
 const TAG = tagIndex !== -1 ? args[tagIndex + 1] : null;
 const MAX_RETRIES = retriesIndex !== -1 ? parseInt(args[retriesIndex + 1]) : 3;
 const DEBUG = args.includes('--debug');
+// --key lets you pass API key inline (fallback for Windows env var issues)
+const CLI_KEY = keyIndex !== -1 ? args[keyIndex + 1] : null;
 
 // Map CLI tag to JUnit5 test method name in KarateTestRunner
 function getTestMethod(tag) {
