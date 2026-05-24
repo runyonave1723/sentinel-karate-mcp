@@ -1,0 +1,16 @@
+{
+  "name": "sentinel-karate-mcp",
+  "version": "1.0.0",
+  "description": "MCP server for Karate test runner with self-healing",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "axios": "^1.6.0",
+    "chalk": "^5.3.0"
+  }
+}

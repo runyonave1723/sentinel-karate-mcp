@@ -1,0 +1,13 @@
+{
+  "name": "sentinel-self-healing",
+  "version": "1.0.0",
+  "description": "Self-healing Karate test runner using Claude AI",
+  "main": "self-heal.js",
+  "type": "module",
+  "scripts": {
+    "heal": "node self-heal.js",
+    "heal:smoke": "node self-heal.js --tag @smoke",
+    "heal:inventory": "node self-heal.js --tag @inventory",
+    "heal:orders": "node self-heal.js --tag @orders"
+  }
+}
