@@ -1,12 +1,12 @@
 #!/usr/bin/env node
 /**
- * Sentinel Self-Healing Script
- * Usage: node self-heal.js [--tag @smoke] [--max-retries 3] [--debug]
+ * Sentinel Self-Healing Script - reads Karate JSON reports for accurate failure detection
+ * Usage: node self-heal.js [--tag @smoke] [--max-retries 3] [--debug] [--key sk-ant-...]
  */
 
 import { exec } from 'child_process';
 import { promisify } from 'util';
-import { readFile, writeFile, readdir } from 'fs/promises';
+import { readFile, writeFile, readdir, access } from 'fs/promises';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
@@ -14,35 +14,32 @@ const execAsync = promisify(exec);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, '..');
 const KARATE_DIR = path.join(REPO_ROOT, 'karate-tests');
-// API key: env var or --key CLI arg
-let ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 
 // Parse CLI args
 const args = process.argv.slice(2);
-const tagIndex = args.indexOf('--tag');
+const tagIndex     = args.indexOf('--tag');
 const retriesIndex = args.indexOf('--max-retries');
-const keyIndex = args.indexOf('--key');
-const TAG = tagIndex !== -1 ? args[tagIndex + 1] : null;
-const MAX_RETRIES = retriesIndex !== -1 ? parseInt(args[retriesIndex + 1]) : 3;
-const DEBUG = args.includes('--debug');
-// --key lets you pass API key inline (fallback for Windows env var issues)
-const CLI_KEY = keyIndex !== -1 ? args[keyIndex + 1] : null;
+const keyIndex     = args.indexOf('--key');
+const TAG          = tagIndex     !== -1 ? args[tagIndex + 1]     : null;
+const MAX_RETRIES  = retriesIndex !== -1 ? parseInt(args[retriesIndex + 1]) : 3;
+const DEBUG        = args.includes('--debug');
+const CLI_KEY      = keyIndex !== -1 ? args[keyIndex + 1] : null;
 
-// Map CLI tag to JUnit5 test method name in KarateTestRunner
+let ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || CLI_KEY || null;
+
+// Map tag to JUnit5 method
 function getTestMethod(tag) {
   if (!tag) return 'runAllTests';
   const t = tag.replace('@', '').toLowerCase();
-  const map = {
-    smoke:     'runSmokeTests',
-    inventory: 'runInventoryTests',
-    orders:    'runOrderTests'
-  };
+  const map = { smoke: 'runSmokeTests', inventory: 'runInventoryTests', orders: 'runOrderTests' };
   return map[t] || 'runAllTests';
 }
 
 console.log(`\n🤖 Sentinel Self-Healing Test Runner`);
 console.log(`   Tag: ${TAG || 'all'} | Max retries: ${MAX_RETRIES} | Debug: ${DEBUG}`);
 console.log(`   Karate dir: ${KARATE_DIR}\n`);
+
+// ─── List feature files ───────────────────────────────────────────────────────
 
 async function listFeatureFiles(dir) {
   const result = [];
@@ -51,103 +48,109 @@ async function listFeatureFiles(dir) {
     for (const entry of entries) {
       const full = path.join(dir, entry.name);
       if (entry.isDirectory()) result.push(...await listFeatureFiles(full));
-      else if (entry.name.endsWith('.feature')) result.push(full);
+      else if (entry.name.endsWith('.feature') && !entry.name.endsWith('.bak')) result.push(full);
     }
   } catch {}
   return result;
 }
 
-function extractFailures(output) {
+// ─── Parse Karate JSON report for failures ────────────────────────────────────
+
+async function parseKarateReport() {
+  const reportDir = path.join(KARATE_DIR, 'target', 'surefire-reports');
+  const karateReportDir = path.join(KARATE_DIR, 'target', 'karate-reports');
+
   const failures = [];
-  const lines = output.split('\n');
-  let current = [];
-  let capturing = false;
+  let totalScenarios = 0;
+  let failedScenarios = 0;
 
-  const failurePatterns = [
-    /FAILED/,
-    /AssertionError/i,
-    /did not match/i,
-    /match failed/i,
-    /response status/i,
-    /status code was/i,
-    /\d{3} != \d{3}/,
-    /scenario.*failed/i,
-    /not equal/i,
-    /expected.*\d{3}/i,
-    /assert.*failed/i,
-    /karate.*FAIL/i,
-    /^\s*\* status \d+/,
-    /html.* was:/i
-  ];
+  // Try karate-reports JSON files first (most detailed)
+  try {
+    const files = await readdir(karateReportDir);
+    const jsonFiles = files.filter(f => f.endsWith('.json') && !f.includes('summary'));
 
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    const isFailure = failurePatterns.some(p => p.test(line));
+    for (const file of jsonFiles) {
+      const content = await readFile(path.join(karateReportDir, file), 'utf8');
+      const report = JSON.parse(content);
 
-    if (isFailure && !capturing) {
-      capturing = true;
-      current = lines.slice(Math.max(0, i - 5), i + 1);
-    } else if (capturing) {
-      current.push(line);
-      if (current.length > 40 || (line.trim() === '' && current.length > 10)) {
-        failures.push(current.join('\n'));
-        capturing = false;
-        current = [];
+      // Karate report structure: array of features
+      const elements = report.elements || report || [];
+      for (const element of elements) {
+        if (!element.steps) continue;
+        totalScenarios++;
+        const failed = element.steps.some(s => s.result?.status === 'failed');
+        if (failed) {
+          failedScenarios++;
+          const failedSteps = element.steps
+            .filter(s => s.result?.status === 'failed')
+            .map(s => `  Step: ${s.name}\n  Error: ${s.result?.error_message || 'unknown'}`)
+            .join('\n');
+          failures.push(`FEATURE: ${file}\nSCENARIO: ${element.name}\n${failedSteps}`);
+        }
       }
     }
-  }
-  if (current.length > 0) failures.push(current.join('\n'));
-
-  // Fallback: build failed but no specific pattern matched → send last 150 lines
-  if (failures.length === 0 && output.includes('BUILD FAILURE')) {
-    console.log('   ⚠️  No specific failure pattern matched — sending full build output to Claude');
-    failures.push(output.split('\n').slice(-150).join('\n'));
+  } catch (e) {
+    if (DEBUG) console.log(`   karate-reports parse: ${e.message}`);
   }
 
-  return failures;
+  // Try karate-summary.json
+  if (failures.length === 0) {
+    try {
+      const summaryPath = path.join(karateReportDir, 'karate-summary.json');
+      const content = await readFile(summaryPath, 'utf8');
+      const summary = JSON.parse(content);
+
+      if (DEBUG) console.log('   karate-summary:', JSON.stringify(summary).slice(0, 500));
+
+      totalScenarios = summary.scenarioCount || 0;
+      failedScenarios = summary.scenariosFailed || 0;
+
+      if (failedScenarios > 0 && summary.featureSummary) {
+        for (const feat of summary.featureSummary) {
+          if (feat.failed > 0) {
+            failures.push(`FEATURE: ${feat.relativePath}\nFailed scenarios: ${feat.failed}\nScenario results: ${JSON.stringify(feat.scenarioResults || {})}`);
+          }
+        }
+      }
+    } catch (e) {
+      if (DEBUG) console.log(`   karate-summary parse: ${e.message}`);
+    }
+  }
+
+  return { failures, totalScenarios, failedScenarios };
 }
+
+// ─── Run tests ────────────────────────────────────────────────────────────────
 
 async function runTests() {
   const method = getTestMethod(TAG);
-
-  // Run specific JUnit5 test method — this is reliable in Karate 1.4.1
-  // -Dsurefire.failIfNoSpecifiedTests=false prevents error when filtering
   const cmd = `cd "${KARATE_DIR}" && mvn test -Dtest=KarateTestRunner#${method} -Dsurefire.failIfNoSpecifiedTests=false`;
 
   console.log(`▶ Running: KarateTestRunner#${method}`);
 
   let output = '';
-  let success = false;
+  let mvnSuccess = false;
 
   try {
     const result = await execAsync(cmd, { timeout: 180000 });
     output = result.stdout + result.stderr;
-    success = true;
+    mvnSuccess = true;
   } catch (err) {
     output = (err.stdout || '') + (err.stderr || '');
-    success = false;
+    mvnSuccess = false;
   }
 
   if (DEBUG) {
-    console.log('\n─── RAW OUTPUT (last 100 lines) ───');
-    console.log(output.split('\n').slice(-100).join('\n'));
-    console.log('───────────────────────────────────\n');
+    console.log('\n─── RAW MVN OUTPUT (last 60 lines) ───');
+    console.log(output.split('\n').slice(-60).join('\n'));
+    console.log('──────────────────────────────────────\n');
   }
 
-  // Karate prints its own summary line
-  const summaryMatch = output.match(/Tests run: \d+, Failures: \d+, Errors: \d+, Skipped: \d+/);
-  const karateMatch  = output.match(/scenarios.*failed/i);
-  const buildResult  = output.includes('BUILD SUCCESS') ? 'BUILD SUCCESS' : 'BUILD FAILURE';
+  // Parse Karate's own JSON report — much more accurate than Maven output
+  const { failures, totalScenarios, failedScenarios } = await parseKarateReport();
 
-  const summary = summaryMatch
-    ? summaryMatch[0]
-    : karateMatch
-    ? karateMatch[0]
-    : buildResult;
-
-  console.log(`   ${success ? '✅' : '❌'} ${summary}`);
-
-  const failures = extractFailures(output);
+  const success = mvnSuccess && failedScenarios === 0;
+  console.log(`   ${success ? '✅' : '❌'} Scenarios: ${totalScenarios} total, ${failedScenarios} failed`);
   console.log(`   🔍 Failures extracted: ${failures.length}`);
 
   if (DEBUG && failures.length > 0) {
@@ -156,17 +159,20 @@ async function runTests() {
     console.log('──────────────────────────\n');
   }
 
-  return { success, output, summary, failures };
+  return { success, output, failures, totalScenarios, failedScenarios };
 }
+
+// ─── Self-heal with Claude ────────────────────────────────────────────────────
 
 async function healWithClaude(failures, featureFiles) {
   if (!ANTHROPIC_API_KEY) {
     console.error('\n❌ ANTHROPIC_API_KEY not set!');
-    console.error('   CMD:  set ANTHROPIC_API_KEY=sk-ant-...');
+    console.error('   Git Bash: export ANTHROPIC_API_KEY="sk-ant-..."');
+    console.error('   Or pass:  node self-heal.js --key sk-ant-...');
     return [];
   }
 
-  console.log(`\n🔧 Calling Claude to analyze ${failures.length} failure(s)...`);
+  console.log(`\n🔧 Calling Claude (claude-opus-4-5) to analyze ${failures.length} failure(s)...`);
 
   const fileContents = {};
   for (const f of featureFiles) {
@@ -184,23 +190,22 @@ ${Object.entries(fileContents).map(([f, c]) => `=== FILE: ${f} ===\n${c}\n`).joi
 TEST FAILURES:
 ${failures.join('\n\n---\n\n')}
 
-TASK: Analyze the failures and identify what is wrong in the feature files.
-Common issues: wrong status code assertion, wrong field name, wrong HTTP method, wrong path, wrong request body.
+TASK: Analyze each failure and identify what is wrong in the feature file.
+Common issues: wrong status code assertion (e.g. 199 instead of 200), wrong field name, wrong path.
 
-Respond with ONLY a valid JSON array — no markdown, no backticks, no explanation outside the JSON:
+Respond with ONLY a valid JSON array — no markdown, no backticks:
 [
   {
     "file": "karate/orders/orders.feature",
-    "reason": "Brief explanation of bug and fix",
+    "reason": "Brief explanation of what was wrong and what was fixed",
     "patchedContent": "...complete corrected content of the feature file..."
   }
 ]
 
 Rules:
-1. Only include files that actually need changes
+1. Only include files that need changes
 2. Do NOT break passing scenarios
-3. Fix only the exact assertion that is failing
-4. Return ONLY valid JSON — no markdown fences`;
+3. Return ONLY valid JSON — no markdown fences`;
 
   try {
     const response = await fetch('https://api.anthropic.com/v1/messages', {
@@ -227,24 +232,25 @@ Rules:
 
     if (DEBUG) {
       console.log('\n─── CLAUDE RESPONSE ───');
-      console.log(text.slice(0, 1500));
+      console.log(text.slice(0, 2000));
       console.log('───────────────────────\n');
     }
 
     const clean = text.replace(/```json\n?|```/g, '').trim();
     return JSON.parse(clean);
   } catch (e) {
-    console.error(`   ❌ Claude call/parse failed: ${e.message}`);
+    console.error(`   ❌ Claude call failed: ${e.message}`);
     return [];
   }
 }
+
+// ─── Apply patches ────────────────────────────────────────────────────────────
 
 async function applyPatches(patches, featureFiles) {
   const applied = [];
   for (const patch of patches) {
     if (!patch.file || !patch.patchedContent) continue;
 
-    // Find the actual file path (handle Windows backslashes)
     const normalizedPatch = patch.file.replace(/\\/g, '/');
     let fullPath = path.join(KARATE_DIR, 'src', 'test', 'resources', patch.file);
 
@@ -273,8 +279,8 @@ async function applyPatches(patches, featureFiles) {
 async function main() {
   if (!ANTHROPIC_API_KEY) {
     console.error('❌ ANTHROPIC_API_KEY is not set.');
-    console.error('   CMD:  set ANTHROPIC_API_KEY=sk-ant-...');
-    console.error('   Bash: export ANTHROPIC_API_KEY=sk-ant-...');
+    console.error('   Git Bash: export ANTHROPIC_API_KEY="sk-ant-..."');
+    console.error('   Or pass:  node self-heal.js --key sk-ant-...');
     process.exit(1);
   }
 
@@ -298,7 +304,7 @@ async function main() {
 
     if (attempt > MAX_RETRIES) {
       console.log(`\n⛔ Max retries (${MAX_RETRIES}) reached. Failures remain.`);
-      console.log('   Run with --debug to see raw output and failures extracted.');
+      console.log('   Run with --debug to inspect raw output and failures.');
       break;
     }
 
