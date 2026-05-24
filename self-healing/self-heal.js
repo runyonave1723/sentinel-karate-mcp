@@ -1,7 +1,12 @@
 #!/usr/bin/env node
 /**
  * Sentinel Self-Healing Script
- * Usage: node self-heal.js [--tag @smoke] [--max-retries 3] [--debug] [--key sk-ant-...]
+ * Supports: Ollama (local/free) or Claude API
+ *
+ * Usage:
+ *   node self-heal.js --tag @orders --max-retries 3
+ *   node self-heal.js --provider ollama --model llama3.1
+ *   node self-heal.js --provider claude --key sk-ant-...
  */
 
 import { exec } from 'child_process';
@@ -11,20 +16,21 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 
 const execAsync = promisify(exec);
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const __dirname  = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT  = path.resolve(__dirname, '..');
 const KARATE_DIR = path.join(REPO_ROOT, 'karate-tests');
 
-// CLI args
-const args         = process.argv.slice(2);
-const tagIndex     = args.indexOf('--tag');
-const retriesIndex = args.indexOf('--max-retries');
-const keyIndex     = args.indexOf('--key');
-const TAG          = tagIndex     !== -1 ? args[tagIndex + 1]           : null;
-const MAX_RETRIES  = retriesIndex !== -1 ? parseInt(args[retriesIndex + 1]) : 3;
-const DEBUG        = args.includes('--debug');
-const CLI_KEY      = keyIndex !== -1 ? args[keyIndex + 1] : null;
-let   ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || CLI_KEY || null;
+// ─── CLI args ─────────────────────────────────────────────────────────────────
+const args          = process.argv.slice(2);
+const get           = (flag) => { const i = args.indexOf(flag); return i !== -1 ? args[i + 1] : null; };
+const TAG           = get('--tag');
+const MAX_RETRIES   = parseInt(get('--max-retries') || '3');
+const DEBUG         = args.includes('--debug');
+const PROVIDER      = get('--provider') || 'ollama';          // ollama | claude
+const MODEL         = get('--model')    || (PROVIDER === 'claude' ? 'claude-opus-4-5' : 'llama3.1');
+const CLI_KEY       = get('--key');
+const CLAUDE_KEY    = process.env.ANTHROPIC_API_KEY || CLI_KEY || null;
+const OLLAMA_URL    = get('--ollama-url') || 'http://localhost:11434';
 
 function getTestMethod(tag) {
   if (!tag) return 'runAllTests';
@@ -33,11 +39,11 @@ function getTestMethod(tag) {
 }
 
 console.log(`\n🤖 Sentinel Self-Healing Test Runner`);
+console.log(`   Provider: ${PROVIDER} | Model: ${MODEL}`);
 console.log(`   Tag: ${TAG || 'all'} | Max retries: ${MAX_RETRIES} | Debug: ${DEBUG}`);
 console.log(`   Karate dir: ${KARATE_DIR}\n`);
 
 // ─── List feature files ───────────────────────────────────────────────────────
-
 async function listFeatureFiles(dir) {
   const result = [];
   try {
@@ -51,17 +57,15 @@ async function listFeatureFiles(dir) {
   return result;
 }
 
-// ─── Parse Karate cucumber JSON reports ──────────────────────────────────────
-
+// ─── Parse Karate JSON reports ────────────────────────────────────────────────
 async function parseKarateJsonReports() {
   const failures = [];
   let totalScenarios = 0;
   let failedScenarios = 0;
 
-  // Karate 1.4.1 writes cucumber JSON to target/cucumber-json/
   const possibleDirs = [
-    path.join(KARATE_DIR, 'target', 'cucumber-json'),
     path.join(KARATE_DIR, 'target', 'karate-reports'),
+    path.join(KARATE_DIR, 'target', 'cucumber-json'),
     path.join(KARATE_DIR, 'target', 'surefire-reports'),
   ];
 
@@ -75,14 +79,14 @@ async function parseKarateJsonReports() {
       if (jsons.length > 0) {
         reportDir = dir;
         jsonFiles = jsons;
-        if (DEBUG) console.log(`   📂 Found ${jsons.length} JSON report(s) in: ${dir}`);
+        if (DEBUG) console.log(`   📂 Reports found in: ${dir}`);
         break;
       }
     } catch {}
   }
 
   if (!reportDir) {
-    if (DEBUG) console.log('   ⚠️  No JSON report dirs found — will rely on Maven stdout');
+    if (DEBUG) console.log('   ⚠️  No JSON report dirs found');
     return { failures, totalScenarios, failedScenarios, found: false };
   }
 
@@ -102,7 +106,7 @@ async function parseKarateJsonReports() {
           if (failedSteps.length > 0) {
             failedScenarios++;
             const stepDetails = failedSteps.map(s =>
-              `  Step: ${s.keyword} ${s.name}\n  Error: ${(s.result?.error_message || 'unknown error').slice(0, 400)}`
+              `  Step: ${s.keyword} ${s.name}\n  Error: ${(s.result?.error_message || 'unknown').slice(0, 400)}`
             ).join('\n');
             failures.push(
               `FEATURE: ${feature.name || file}\n` +
@@ -121,45 +125,7 @@ async function parseKarateJsonReports() {
   return { failures, totalScenarios, failedScenarios, found: true };
 }
 
-// ─── Parse Maven stdout as fallback ──────────────────────────────────────────
-
-function extractFailuresFromStdout(output) {
-  const failures = [];
-  const lines = output.split('\n');
-  let current = [];
-  let capturing = false;
-
-  const patterns = [
-    /FAILED/, /AssertionError/i, /did not match/i, /match failed/i,
-    /\d{3} != \d{3}/, /not equal/i, /expected.*\d{3}/i, /assert.*failed/i,
-    /getFailCount|scenarios.*failed/i, /com\.intuit\.karate.*Exception/i
-  ];
-
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    if (patterns.some(p => p.test(line)) && !capturing) {
-      capturing = true;
-      current = lines.slice(Math.max(0, i - 3), i + 1);
-    } else if (capturing) {
-      current.push(line);
-      if (current.length > 40 || (line.trim() === '' && current.length > 8)) {
-        failures.push(current.join('\n'));
-        capturing = false;
-        current = [];
-      }
-    }
-  }
-  if (current.length > 0) failures.push(current.join('\n'));
-
-  // Last resort: whole tail if BUILD FAILURE
-  if (failures.length === 0 && output.includes('BUILD FAILURE')) {
-    failures.push(output.split('\n').slice(-120).join('\n'));
-  }
-  return failures;
-}
-
 // ─── Run tests ────────────────────────────────────────────────────────────────
-
 async function runTests() {
   const method = getTestMethod(TAG);
   const cmd = `cd "${KARATE_DIR}" && mvn test -Dtest=KarateTestRunner#${method} -Dsurefire.failIfNoSpecifiedTests=false`;
@@ -184,21 +150,8 @@ async function runTests() {
     console.log('──────────────────────────────────────\n');
   }
 
-  // Try JSON reports first, fall back to stdout parsing
   const report = await parseKarateJsonReports();
-  let failures = report.failures;
-  let { totalScenarios, failedScenarios } = report;
-
-  if (!report.found || (failures.length === 0 && !mvnSuccess)) {
-    // Fallback: parse Maven stdout
-    const stdoutFailures = extractFailuresFromStdout(output);
-    if (stdoutFailures.length > 0) {
-      failures = stdoutFailures;
-      failedScenarios = stdoutFailures.length;
-      if (DEBUG) console.log('   ℹ️  Using stdout-based failure extraction as fallback');
-    }
-  }
-
+  const { failures, totalScenarios, failedScenarios } = report;
   const success = mvnSuccess && failedScenarios === 0;
 
   if (totalScenarios > 0) {
@@ -217,20 +170,9 @@ async function runTests() {
   return { success, output, failures, totalScenarios, failedScenarios };
 }
 
-// ─── Self-heal with Claude ────────────────────────────────────────────────────
-
-async function healWithClaude(failures, featureFiles) {
-  console.log(`\n🔧 Calling Claude (claude-opus-4-5) to analyze ${failures.length} failure(s)...`);
-
-  const fileContents = {};
-  for (const f of featureFiles) {
-    const rel = f
-      .replace(path.join(KARATE_DIR, 'src', 'test', 'resources') + path.sep, '')
-      .replace(/\\/g, '/');
-    fileContents[rel] = await readFile(f, 'utf8');
-  }
-
-  const prompt = `You are an expert Karate API test engineer and self-healing agent.
+// ─── Build prompt ─────────────────────────────────────────────────────────────
+function buildPrompt(failures, fileContents) {
+  return `You are an expert Karate API test engineer and self-healing agent.
 
 CURRENT FEATURE FILES:
 ${Object.entries(fileContents).map(([f, c]) => `=== FILE: ${f} ===\n${c}\n`).join('\n')}
@@ -241,7 +183,7 @@ ${failures.join('\n\n---\n\n')}
 TASK: Analyze the failures and identify what is wrong in the feature files.
 Common issues: wrong status code (e.g. 199 instead of 200), wrong field name, wrong path.
 
-Respond with ONLY a valid JSON array — no markdown, no backticks:
+Respond with ONLY a valid JSON array — no markdown, no backticks, no explanation:
 [
   {
     "file": "karate/orders/orders.feature",
@@ -253,47 +195,113 @@ Respond with ONLY a valid JSON array — no markdown, no backticks:
 Rules:
 1. Only include files that need changes
 2. Do NOT break passing scenarios
-3. Return ONLY valid JSON — no markdown fences`;
+3. Return ONLY valid JSON — no markdown fences, no extra text`;
+}
+
+// ─── Call Ollama (local, free) ────────────────────────────────────────────────
+async function callOllama(prompt) {
+  console.log(`   🦙 Calling Ollama (${MODEL}) at ${OLLAMA_URL}...`);
+
+  const response = await fetch(`${OLLAMA_URL}/api/generate`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model: MODEL,
+      prompt,
+      stream: false,
+      options: {
+        temperature: 0.1,   // low temp for deterministic code fixes
+        num_predict: 4096
+      }
+    })
+  });
+
+  if (!response.ok) {
+    const err = await response.text();
+    throw new Error(`Ollama error ${response.status}: ${err}`);
+  }
+
+  const data = await response.json();
+  return data.response || '';
+}
+
+// ─── Call Claude API ──────────────────────────────────────────────────────────
+async function callClaude(prompt) {
+  if (!CLAUDE_KEY) throw new Error('ANTHROPIC_API_KEY not set. Use --key or export env var.');
+
+  console.log(`   🤖 Calling Claude API (${MODEL})...`);
+
+  const response = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': CLAUDE_KEY,
+      'anthropic-version': '2023-06-01'
+    },
+    body: JSON.stringify({
+      model: MODEL,
+      max_tokens: 8000,
+      messages: [{ role: 'user', content: prompt }]
+    })
+  });
+
+  if (!response.ok) throw new Error(`Claude API error ${response.status}: ${await response.text()}`);
+
+  const data = await response.json();
+  return data.content?.[0]?.text || '';
+}
+
+// ─── Heal with AI ─────────────────────────────────────────────────────────────
+async function healWithAI(failures, featureFiles) {
+  console.log(`\n🔧 Analyzing ${failures.length} failure(s) with ${PROVIDER}/${MODEL}...`);
+
+  const fileContents = {};
+  for (const f of featureFiles) {
+    const rel = f
+      .replace(path.join(KARATE_DIR, 'src', 'test', 'resources') + path.sep, '')
+      .replace(/\\/g, '/');
+    fileContents[rel] = await readFile(f, 'utf8');
+  }
+
+  const prompt = buildPrompt(failures, fileContents);
+
+  let rawText = '';
+  try {
+    if (PROVIDER === 'claude') {
+      rawText = await callClaude(prompt);
+    } else {
+      rawText = await callOllama(prompt);
+    }
+  } catch (e) {
+    console.error(`   ❌ AI call failed: ${e.message}`);
+    if (PROVIDER === 'ollama') {
+      console.error('   💡 Is Ollama running? Try: ollama serve');
+      console.error(`   💡 Is the model pulled? Try: ollama pull ${MODEL}`);
+    }
+    return [];
+  }
+
+  if (DEBUG) {
+    console.log('\n─── AI RESPONSE ───');
+    console.log(rawText.slice(0, 2000));
+    console.log('───────────────────\n');
+  }
 
   try {
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01'
-      },
-      body: JSON.stringify({
-        model: 'claude-opus-4-5',
-        max_tokens: 8000,
-        messages: [{ role: 'user', content: prompt }]
-      })
-    });
-
-    if (!response.ok) {
-      console.error(`   ❌ Claude API error ${response.status}: ${await response.text()}`);
-      return [];
-    }
-
-    const data = await response.json();
-    const text = data.content?.[0]?.text || '[]';
-
-    if (DEBUG) {
-      console.log('\n─── CLAUDE RESPONSE ───');
-      console.log(text.slice(0, 2000));
-      console.log('───────────────────────\n');
-    }
-
-    const clean = text.replace(/```json\n?|```/g, '').trim();
-    return JSON.parse(clean);
+    const clean = rawText.replace(/```json\n?|```/g, '').trim();
+    // Find the JSON array in the response
+    const jsonStart = clean.indexOf('[');
+    const jsonEnd   = clean.lastIndexOf(']');
+    if (jsonStart === -1 || jsonEnd === -1) throw new Error('No JSON array found in response');
+    return JSON.parse(clean.slice(jsonStart, jsonEnd + 1));
   } catch (e) {
-    console.error(`   ❌ Claude call failed: ${e.message}`);
+    console.error(`   ❌ Failed to parse AI response: ${e.message}`);
+    if (DEBUG) console.error('   Raw:', rawText.slice(0, 500));
     return [];
   }
 }
 
 // ─── Apply patches ────────────────────────────────────────────────────────────
-
 async function applyPatches(patches, featureFiles) {
   const applied = [];
   for (const patch of patches) {
@@ -323,12 +331,10 @@ async function applyPatches(patches, featureFiles) {
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
-
 async function main() {
-  if (!ANTHROPIC_API_KEY) {
-    console.error('❌ ANTHROPIC_API_KEY is not set.');
-    console.error('   Git Bash: export ANTHROPIC_API_KEY="sk-ant-..."');
-    console.error('   Or pass:  node self-heal.js --key sk-ant-...');
+  if (PROVIDER === 'claude' && !CLAUDE_KEY) {
+    console.error('❌ Claude provider selected but ANTHROPIC_API_KEY not set.');
+    console.error('   Switch to Ollama: node self-heal.js --provider ollama');
     process.exit(1);
   }
 
@@ -356,9 +362,9 @@ async function main() {
       break;
     }
 
-    const patches = await healWithClaude(lastResult.failures, featureFiles);
+    const patches = await healWithAI(lastResult.failures, featureFiles);
     if (patches.length === 0) {
-      console.log('\n⚠️  Claude generated no patches. Stopping.');
+      console.log('\n⚠️  AI generated no patches. Stopping.');
       break;
     }
 
