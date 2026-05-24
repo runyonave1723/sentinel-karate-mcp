@@ -177,27 +177,61 @@ async function runTests() {
 
 // ─── Build prompt ─────────────────────────────────────────────────────────────
 function buildPrompt(failures, fileContents) {
-  // Compact file content: strip blank lines to reduce tokens
-  const compactFiles = Object.entries(fileContents).map(([f, c]) => {
-    const compact = c.split('\n').filter(l => l.trim()).join('\n');
-    return `=== ${f} ===\n${compact}`;
-  }).join('\n\n');
+  // Extract only the failing scenario block from each file
+  const relevantSnippets = [];
+  for (const [fileName, content] of Object.entries(fileContents)) {
+    for (const failure of failures) {
+      // Get scenario name from failure
+      const scenarioMatch = failure.match(/SCENARIO: (.+)/);
+      const scenarioName = scenarioMatch ? scenarioMatch[1].trim() : null;
+      const stepMatch = failure.match(/Step: (.+)/);
+      const failingStep = stepMatch ? stepMatch[1].trim() : null;
+      const errorMatch = failure.match(/Error: (.+)/);
+      const errorMsg = errorMatch ? errorMatch[1].slice(0, 150) : null;
 
-  // Compact failures: strip long response bodies
-  const compactFailures = failures.map(f =>
-    f.split('\n').map(l => l.length > 200 ? l.slice(0, 200) + '...' : l).join('\n')
-  ).join('\n---\n');
+      // Find the failing scenario block in the file
+      const lines = content.split('\n');
+      let snippetLines = [];
+      let inScenario = false;
+      let scenarioFound = false;
 
-  return `Fix failing Karate API tests. Return ONLY a JSON array, no markdown.
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        if (line.match(/^\s*(Scenario|Background):/i)) {
+          if (inScenario && scenarioFound) break;
+          inScenario = true;
+          if (scenarioName && line.includes(scenarioName)) {
+            scenarioFound = true;
+            // Include 3 lines before for context (tags)
+            snippetLines = lines.slice(Math.max(0, i - 3), i + 1);
+          } else {
+            scenarioFound = false;
+            snippetLines = [];
+          }
+        } else if (inScenario && scenarioFound) {
+          snippetLines.push(line);
+        }
+      }
 
-FILES:
-${compactFiles}
+      if (snippetLines.length > 0) {
+        relevantSnippets.push(
+          `FILE: ${fileName}\nFAILING SCENARIO:\n${snippetLines.join('\n')}\nERROR: ${errorMsg}\nFAILING STEP: ${failingStep}`
+        );
+      } else {
+        // Fallback: send first 30 lines of file
+        relevantSnippets.push(
+          `FILE: ${fileName}\nFIRST 30 LINES:\n${lines.slice(0, 30).join('\n')}\nERROR: ${errorMsg}\nFAILING STEP: ${failingStep}`
+        );
+      }
+    }
+  }
 
-FAILURES:
-${compactFailures}
+  return `Fix a failing Karate API test. Return ONLY valid JSON, no markdown.
 
-Return JSON array:
-[{"file":"path/to/file.feature","reason":"what was wrong","patchedContent":"full corrected file content"}]`;
+${relevantSnippets.join('\n\n')}
+
+Return this exact JSON structure:
+[{"file":"karate/orders/orders.feature","reason":"brief explanation","patchedContent":"ONLY the fixed scenario block as a complete feature file"}]`;
 }
 
 // ─── Call Ollama (local, free) ────────────────────────────────────────────────
