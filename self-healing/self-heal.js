@@ -509,17 +509,13 @@ async function applyPatches(patches, featureFiles) {
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 async function main() {
+  // API key checks are soft warnings only - rule-based healer works without any key
   if (PROVIDER === 'claude' && !CLAUDE_KEY) {
-    console.error('❌ Claude provider needs ANTHROPIC_API_KEY.');
-    console.error('   Or use Groq (free): node self-heal.js --provider groq --key gsk_...');
-    process.exit(1);
+    console.warn('⚠️  No ANTHROPIC_API_KEY - will use rule-based healing only');
   }
   if (PROVIDER === 'groq' && !GROQ_KEY) {
-    console.error('❌ Groq provider needs GROQ_API_KEY.');
-    console.error('   1. Get free key at console.groq.com');
-    console.error('   2. export GROQ_API_KEY=gsk_your_key');
-    console.error('   Or pass inline: node self-heal.js --provider groq --key gsk_...');
-    process.exit(1);
+    console.warn('⚠️  No GROQ_API_KEY - will use rule-based healing only');
+    console.warn('   For AI healing: export GROQ_API_KEY=gsk_... or pass --key gsk_...');
   }
 
   const featuresBaseDir = path.join(KARATE_DIR, 'src', 'test', 'resources', 'karate');
