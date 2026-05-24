@@ -2,6 +2,7 @@ package karate;
 
 import com.intuit.karate.junit5.Karate;
 import org.junit.jupiter.api.Test;
+// Note: com.intuit.karate groupId confirmed for 1.4.1
 
 class KarateTestRunner {
 

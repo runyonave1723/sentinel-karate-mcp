@@ -17,7 +17,7 @@
 
     <dependencies>
         <dependency>
-            <groupId>io.karatelabs</groupId>
+            <groupId>com.intuit.karate</groupId>
             <artifactId>karate-junit5</artifactId>
             <version>${karate.version}</version>
             <scope>test</scope>
